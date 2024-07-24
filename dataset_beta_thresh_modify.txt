@@ -1,0 +1,890 @@
+
+import os
+
+import numpy
+import numpy as np
+from torch.utils.data import Dataset
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import cv2
+import glob
+import imgaug.augmenters as iaa
+from PIL import Image
+import random
+from data.perlin import rand_perlin_2d_np
+import json
+
+
+from os.path import join
+from scipy.ndimage.morphology import binary_dilation
+from torchvision import datasets, transforms
+from data.model import FeatureExtractor
+from data.utils import *
+
+texture_list = ['carpet', 'zipper', 'leather', 'tile', 'wood','grid',
+                'Class1', 'Class2', 'Class3', 'Class4', 'Class5',
+                 'Class6', 'Class7', 'Class8', 'Class9', 'Class10']
+
+# read file from argument
+file = "args1.json"
+# load the json args
+with open(f'args/{file}', 'r') as f:
+    args = json.load(f)
+
+class MVTecTestDataset(Dataset):
+
+    def __init__(self, data_path,classname,img_size):
+        self.root_dir = os.path.join(data_path,'test')
+        self.images = sorted(glob.glob(self.root_dir+"/*/*.png"))
+        self.resize_shape = [img_size[0], img_size[1]]
+
+    def __len__(self):
+        return len(self.images)
+
+    def transform_image(self, image_path, mask_path):
+        image = cv2.cvtColor(cv2.imread(image_path),cv2.COLOR_BGR2RGB)
+        if mask_path is not None:
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        else:
+            mask = np.zeros((image.shape[0], image.shape[1]))
+        if self.resize_shape != None:
+            image = cv2.resize(image, dsize=(
+                self.resize_shape[1], self.resize_shape[0]))
+            mask = cv2.resize(mask, dsize=(
+                self.resize_shape[1], self.resize_shape[0]))
+
+        image = image / 255.0
+        mask = mask / 255.0
+
+        image = np.array(image).reshape(
+            (image.shape[0], image.shape[1], 3)).astype(np.float32)
+        mask = np.array(mask).reshape(
+            (mask.shape[0], mask.shape[1], 1)).astype(np.float32)
+
+        image = np.transpose(image, (2, 0, 1))
+        mask = np.transpose(mask, (2, 0, 1))
+        return image, mask
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        img_path = self.images[idx]
+        dir_path, file_name = os.path.split(img_path)
+        base_dir = os.path.basename(dir_path)
+        if base_dir == 'good':
+            image, mask = self.transform_image(img_path, None)
+            has_anomaly = np.array([0], dtype=np.float32)
+        else:
+            mask_path = os.path.join(dir_path, '../../ground_truth/')
+            mask_path = os.path.join(mask_path, base_dir)
+            mask_file_name = file_name.split(".")[0]+"_mask.png"
+            mask_path = os.path.join(mask_path, mask_file_name)
+            image, mask = self.transform_image(img_path, mask_path)
+            has_anomaly = np.array([1], dtype=np.float32)
+
+        tempMask = mask.squeeze()
+        sample = {'image': image, 'has_anomaly': has_anomaly,
+                  'mask': mask, 'idx': idx,'type':img_path[len(self.root_dir):-8],'file_name':base_dir+'_'+file_name}
+
+        return sample
+
+class MVTecTrainDataset(Dataset):
+
+    def __init__(self, data_path,classname,img_size,args):
+
+        self.classname=classname
+        # data_path:'datasets/mvtec\\carpet'
+        self.root_dir = os.path.join(data_path,'train','good')
+        #   "img_size": [256,256],
+        self.resize_shape = [img_size[0], img_size[1]]
+        #   "anomaly_source_path":"datasets/DTD",
+        self.anomaly_source_path = args["anomaly_source_path"]
+
+        # 提取训练图片，全是正常样本
+        self.image_paths = sorted(glob.glob(self.root_dir+"/*.png"))
+        # 随机提取纹理特征图片，用于生成局部异常
+        self.anomaly_source_paths = sorted(glob.glob(self.anomaly_source_path+"/images/*/*.jpg"))
+
+        # 图像增强器
+        self.augmenters = [iaa.GammaContrast((0.5, 2.0), per_channel=True),
+
+
+                           #  iaa.AddToBrightness
+                           iaa.AddToHueAndSaturation(
+                               (-50, 50), per_channel=True),
+                           # iaa.MultiplyBrightness(0.7,1.3),
+                           iaa.Invert(),
+                           # iaa.Posterize(),
+                           # iaa.pillike.EnhanceSharpness(),
+                           iaa.Affine(rotate=(-45, 45))
+                           ]
+
+        # 旋转图片
+        self.rot = iaa.Sequential([iaa.Affine(rotate=(-90, 90))])
+
+
+        #foreground path of textural classes
+        # 获取纹理图像的前景图片
+        foreground_path = os.path.join(args["mvtec_root_path"],'carpet')
+        self.textural_foreground_path = sorted(glob.glob(foreground_path +"/thresh/*.png"))
+
+
+
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    # 随机获取前景图像路径
+    def random_choice_foreground_path(self):
+        foreground_path_id = torch.randint(0, len(self.textural_foreground_path), (1,)).item()
+        foreground_path = self.textural_foreground_path[foreground_path_id]
+        return foreground_path
+
+
+    # 获得mvtec图像的前景图片路径
+    def get_foreground_mvtec(self,image_path):
+        classname = self.classname
+        if classname in texture_list:
+            foreground_path = self.random_choice_foreground_path()
+        else:
+            # 若不是纹理图片，直接获得训练图片
+            foreground_path = image_path.replace('train', 'DISthresh')
+        return foreground_path
+
+
+
+
+    def randAugmenter(self):
+        aug_ind = np.random.choice(
+            np.arange(len(self.augmenters)), 3, replace=False)
+        aug = iaa.Sequential([self.augmenters[aug_ind[0]],
+                              self.augmenters[aug_ind[1]],
+                              self.augmenters[aug_ind[2]]]
+                             )
+        return aug
+
+
+    # 基于perlin噪声进行数据增强
+    # # image原始图像、前景掩膜\原始图像训练、DTD数据图片路径、cv2处理后的原始图像
+    def perlin_synthetic(self, image, thresh, anomaly_source_path, cv2_image,thresh_path):
+
+        no_anomaly = torch.rand(1).numpy()[0]
+        # 为一半的图像加噪声（异常），一半的图像不加异常
+        # if no_anomaly > 0.5:
+        #     # 首先生成一个随机数no_anomaly,如果这个数大于0.5
+        #     # 则直接返回原始图像和对应的全零掩码(mask)以及标签(label)为0.0,表示没有异常。
+        #     image = image.astype(np.float32)
+        #     return image, np.zeros((self.resize_shape[0], self.resize_shape[1], 1), dtype=np.float32), np.array([0.0], dtype=np.float32)
+        #
+        # else:
+            # 随机生成perlin_scalex和perlin_scaley两个参数,用于控制Perlin噪声的尺度
+        perlin_scale = 6
+        min_perlin_scale = 0
+        perlin_scalex = 2 ** (torch.randint(min_perlin_scale,
+                              perlin_scale, (1,)).numpy()[0])
+        perlin_scaley = 2 ** (torch.randint(min_perlin_scale,
+                              perlin_scale, (1,)).numpy()[0])
+
+        has_anomaly = 0
+        try_cnt = 0
+        while(has_anomaly == 0 and try_cnt<50):
+            # 使用rand_perlin_2d_np函数生成Perlin噪声图,并将其随机旋转
+            perlin_noise = rand_perlin_2d_np(
+                (self.resize_shape[0], self.resize_shape[1]), (perlin_scalex, perlin_scaley))
+            # 将噪声旋转
+            perlin_noise = self.rot(image=perlin_noise)
+            threshold = 0.5
+            # 根据噪声生成掩码图
+            perlin_thr = np.where(perlin_noise > threshold, np.ones_like(perlin_noise), np.zeros_like(perlin_noise))
+
+            object_perlin = thresh*perlin_thr
+
+            object_perlin = np.expand_dims(object_perlin, axis=2).astype(np.float32)
+
+            msk = (object_perlin).astype(np.float32)
+            # 只要生成了一个有异常的掩码矩阵，就跳出循环
+            if np.sum(msk) !=0:
+                has_anomaly = 1
+            try_cnt+=1
+
+        # 如果训练数据是纹理图像就只对DTD图像增强，否则1/2概率对DTD增强
+        if self.classname in texture_list: # only DTD
+            # 获得数据增强器对DTD纹理图进行增强
+            aug = self.randAugmenter()
+            anomaly_source_img = cv2.cvtColor(cv2.imread(anomaly_source_path),cv2.COLOR_BGR2RGB)
+            anomaly_source_img = cv2.resize(anomaly_source_img, dsize=(
+                self.resize_shape[1], self.resize_shape[0]))
+            # print(type(anomaly_source_img))
+            anomaly_img_augmented = aug(image=anomaly_source_img)
+            # 最后在和perlin噪声掩码图进行归一化
+            img_object_thr = anomaly_img_augmented.astype(
+                np.float32) * object_perlin/255.0
+        else: # DTD and self-augmentation
+            texture_or_patch = torch.rand(1).numpy()[0]
+            if texture_or_patch > 0.5:  # >0.5 is DTD  # 与＜0.5操作一样
+                aug = self.randAugmenter()
+                anomaly_source_img = cv2.cvtColor(cv2.imread(anomaly_source_path),cv2.COLOR_BGR2RGB)
+                anomaly_source_img = cv2.resize(anomaly_source_img, dsize=(
+                    self.resize_shape[1], self.resize_shape[0]))
+                anomaly_img_augmented = aug(image=anomaly_source_img)
+                img_object_thr = anomaly_img_augmented.astype(
+                    np.float32) * object_perlin/255.0
+
+            else: #self-augmentation
+                aug = self.randAugmenter()
+                # 对原始训练的纹理图像进行增强（carpet）
+                anomaly_image = aug(image=cv2_image)
+                high, width = anomaly_image.shape[0], anomaly_image.shape[1]
+                gird_high, gird_width = int(high/8), int(width/8)
+                # 将原始图片划分成8*8的网格，并随机打乱网格块的顺序
+                wi = np.split(anomaly_image, range(
+                    gird_width, width, gird_width), axis=1)
+                wi1 = wi[::2]
+                random.shuffle(wi1)
+                wi2 = wi[1::2]
+                random.shuffle(wi2)
+
+                width_cut_image = np.concatenate(
+                    (np.concatenate(wi1, axis=1), np.concatenate(wi2, axis=1)), axis=1)
+                hi = np.split(width_cut_image, range(
+                    gird_high, high, gird_high), axis=0)
+                random.shuffle(hi)
+                hi1 = hi[::2]
+                random.shuffle(hi1)
+                hi2 = hi[1::2]
+                random.shuffle(hi2)
+                # # 将打乱顺序的网格块拼接回原始尺寸,得到最终的图像mixer_cut_image
+                mixer_cut_image = np.concatenate(
+                    (np.concatenate(hi1, axis=0), np.concatenate(hi2, axis=0)), axis=0)
+                # 最后在和perlin噪声掩码图进行归一化
+                # perlin_thr = np.where(perlin_noise > threshold, np.ones_like(perlin_noise), np.zeros_like(perlin_noise))
+                # object_perlin = thresh*perlin_thr
+                img_object_thr = mixer_cut_image.astype(
+                    np.float32) * object_perlin/255.0
+        # beta表示保留一定自己的特征
+        beta = torch.rand(1).numpy()[0] * 0.6 + 0.2
+        augmented_image = image * \
+            (1 - object_perlin) + (1 - beta) * \
+            img_object_thr + beta * image * (object_perlin)
+
+        augmented_image = augmented_image.astype(np.float32)
+
+        # 返回增强后的图像、掩膜矩阵、重新标签的异常标签（因为训练时候只有正常图像，而我们随机对其了异常增强）
+        return augmented_image, msk, np.array([has_anomaly], dtype=np.float32)
+
+
+    def __getitem__(self, idx):
+        # print(str(idx) + "*********MVTEC get IDX")
+        # 随机图片id
+        idx = torch.randint(0, len(self.image_paths), (1,)).item()
+        # 根据id获取某个图片路径（这里用carpet训练过程举例，就是280个训练图像中的一个）
+        image_path = self.image_paths[idx]
+        image = cv2.cvtColor(cv2.imread(image_path),cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, dsize=(self.resize_shape[1], self.resize_shape[0]))
+        cv2_image=image
+        # 获得纹理前景图像
+        thresh_path = self.get_foreground_mvtec(image_path)
+        thresh=cv2.imread(thresh_path,0)
+        thresh = cv2.resize(thresh,dsize=(self.resize_shape[1], self.resize_shape[0]))
+
+        # 将图像和前景掩码图像都归一化到 0-1
+        thresh = np.array(thresh).astype(np.float32)/255.0
+        image = np.array(image).astype(np.float32)/255.0
+
+
+        # len(self.anomaly_source_paths)表示异常数据集的所有图片量
+        anomaly_source_idx = torch.randint(0, len(self.anomaly_source_paths), (1,)).item()
+        # 随机选取纹理图片路径
+        anomaly_path = self.anomaly_source_paths[anomaly_source_idx]
+        # image原始图像、前景掩膜\原始图像训练、DTD数据图片路径、cv2处理后的原始图像
+        augmented_image, anomaly_mask, has_anomaly  = self.perlin_synthetic(image,thresh,anomaly_path,cv2_image,thresh_path)
+
+        augmented_image = np.transpose(augmented_image, (2, 0, 1))
+        image = np.transpose(image, (2, 0, 1))
+        anomaly_mask = np.transpose(anomaly_mask, (2, 0, 1))
+
+
+        sample = {'image': image, "anomaly_mask": anomaly_mask,
+                  'augmented_image': augmented_image, 'has_anomaly': has_anomaly, 'idx': idx}
+
+        return sample
+
+
+def downsampling(x, size, to_tensor=False, bin=True):
+    if to_tensor:
+        x = torch.FloatTensor(x).to('cuda')
+    #     F.interpolate既可以下采样也可以上采样
+    down = F.interpolate(x, size=size, mode='bilinear', align_corners=False)
+    if bin:
+        down[down > 0] = 1
+    return down
+
+# class Upsample(nn.Module):
+#     def __init__(self, in_channels, with_conv):
+#         super().__init__()
+#         self.with_conv = with_conv
+#         if self.with_conv:
+#             self.conv = torch.nn.Conv2d(in_channels,
+#                                         in_channels,
+#                                         kernel_size=3,
+#                                         stride=1,
+#                                         padding=1)
+#
+#     def forward(self, x):
+#        # 插值（上采样）不改变通道的维度
+#         x = torch.nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
+#         if self.with_conv:
+#             x = self.conv(x)
+#         return x
+
+# class Downsample(nn.Module):
+#     def __init__(self, in_channels, with_conv):
+#         super().__init__()
+#         self.with_conv = with_conv
+#         if self.with_conv:
+#             # no asymmetric padding in torch conv, must do it ourselves
+#             self.conv = torch.nn.Conv2d(in_channels,
+#                                         in_channels,
+#                                         kernel_size=3,
+#                                         stride=2,
+#                                         padding=0)
+#
+#     def forward(self, x):
+#         if self.with_conv:
+#             pad = (0,1,0,1)
+#             x = torch.nn.functional.pad(x, pad, mode="constant", value=0)
+#             x = self.conv(x)
+#         else:
+#             x = torch.nn.functional.avg_pool2d(x, kernel_size=2, stride=2)
+#         return x
+
+
+class MVTec3DTrainDataset(Dataset):
+    def __init__(self, get_mask=True, classname=None, args=None):
+        super(MVTec3DTrainDataset, self).__init__()
+
+        # 随机提取纹理特征图片，用于生成局部异常
+        self.anomaly_source_paths = sorted(glob.glob(args["anomaly_source_path"]+"/images/*/*.jpg"))
+        self.args = args
+        # 图像增强器
+        self.augmenters = [iaa.GammaContrast((0.5, 2.0), per_channel=True),
+
+
+                           #  iaa.AddToBrightness
+                           iaa.AddToHueAndSaturation(
+                               (-50, 50), per_channel=True),
+                           iaa.AddToHueAndSaturation(
+                               (-30, 30), per_channel=True),
+                           # iaa.MultiplyBrightness(0.7,1.3),
+                           iaa.Invert(),
+                           # iaa.Posterize(),
+                           # iaa.pillike.EnhanceSharpness(),
+                           iaa.Affine(rotate=(-45, 45)) #这个是可以用的，但是旋转会不好对深度图像进行加异常
+                           ]
+
+        self.features_t = None
+        self.features_m = None
+        self.features_b = None
+
+        # 旋转图片
+        self.rot_perlin = iaa.Sequential([iaa.Affine(rotate=(-90, 90))])
+        #   "anomaly_source_path":"datasets/DTD",
+        self.anomaly_source_path = args["anomaly_source_path"]
+        self.class_name = classname
+        self.set = "train"
+        self.labels = list()
+        self.masks = list()
+        self.images = list()
+        self.depths = list()
+
+        self.get_mask = get_mask
+        self.get_features = args["get_features"]
+        self.image_transforms = transforms.Compose([transforms.Resize(args["img_size"]), transforms.ToTensor(),
+                                                    transforms.Normalize(args["norm_mean"], args["norm_std"])])
+        self.extract_model = FeatureExtractor(layer_idx=args["extract_layer"])
+        self.extract_model.to('cuda')
+        self.extract_model.eval()
+
+        root = join(args["mvtec3d_root_path"], classname)
+        set_dir = os.path.join(root, self.set)
+        subclass = os.listdir(set_dir)
+        subclass.sort()
+        for sc in subclass: #训练数据只有"good"
+            sub_dir = os.path.join(set_dir, sc)
+            img_dir = join(sub_dir, 'rgb') if args["use_3D_dataset"] else sub_dir
+            # 获得所有rgb图片的路径
+            img_paths = os.listdir(img_dir)
+            # 对图片进行排序
+            img_paths.sort()
+            # 遍历所有图片路径
+            for p in img_paths:
+                # 加载图片完整路径，p为文件名
+                i_path = os.path.join(img_dir, p)
+                # 如果图片不是下面这几种格式直接跳过
+                if not i_path.lower().endswith(
+                        ('.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff', '.webp')):
+                    continue
+                # 添加图片完整路径
+                self.images.append(i_path)
+
+                # 添加深度图片完整路径
+                if args["use_3D_dataset"]:
+                    #  把rgb替换为z,.npy文件里面有深度图像的掩码和深度数据
+                    self.depths.append(i_path.replace('rgb', 'z')[:-4] + '.npy')
+
+        if self.get_features:
+            # 获取不同类别图的特征，可能是之前已经提取过的
+            self.features_t = np.load(os.path.join(args["feature_dir"], classname, self.set + '_t.npy'))
+            self.features_m = np.load(os.path.join(args["feature_dir"], classname, self.set + '_m.npy'))
+            self.features_b = np.load(os.path.join(args["feature_dir"], classname, self.set + '_b.npy'))
+
+        # self.img_mean = torch.FloatTensor(args["norm_mean"])[:, None, None]
+        # self.img_std = torch.FloatTensor(args["norm_std"])[:, None, None]
+
+        foreground_path = os.path.join(args["mvtec3d_root_path"],classname)
+        self.foreground_path = sorted(glob.glob(foreground_path +"/fg/*.png"))
+
+    def __len__(self):
+        return len(self.images)
+
+
+
+
+    def randAugmenter(self):
+        aug_ind = np.random.choice(
+            np.arange(len(self.augmenters)), 3, replace=False)
+        aug = iaa.Sequential([self.augmenters[aug_ind[0]],
+                              self.augmenters[aug_ind[1]],
+                              self.augmenters[aug_ind[2]]]
+                             )
+        return aug
+
+    # img_rgb, fg_rgb, depth, fg_deep,anomaly_path,cv2_image,cv2_depth
+    def perlin_synthetic(self, img_rgb, fg_rgb, depth, fg_deep, anomaly_path, cal_image, cal_depth, sub_fg_depth):
+
+        # no_anomaly = torch.rand(1).numpy()[0]
+        # 为一半的图像加噪声（异常），一半的图像不加异常
+        # if no_anomaly > 0.5:
+        #     # 首先生成一个随机数no_anomaly,如果这个数大于0.5
+        #     # 则直接返回原始图像和对应的全零掩码(mask)以及标签(label)为0.0,表示没有异常。
+        #     image = image.astype(np.float32)
+        #     return image, np.zeros((self.resize_shape[0], self.resize_shape[1], 1), dtype=np.float32), np.array([0.0], dtype=np.float32)
+        #
+        # else:
+            # 随机生成perlin_scalex和perlin_scaley两个参数,用于控制Perlin噪声的尺度
+        perlin_scale = 6
+        min_perlin_scale = 0
+        perlin_scalex = 2 ** (torch.randint(min_perlin_scale,
+                              perlin_scale, (1,)).numpy()[0])
+        perlin_scaley = 2 ** (torch.randint(min_perlin_scale,
+                              perlin_scale, (1,)).numpy()[0])
+
+        is_anomaly = 0
+        try_cnt = 0
+        while(is_anomaly == 0 and try_cnt<100):
+            # 使用rand_perlin_2d_np函数生成Perlin噪声图,并将其随机旋转
+            perlin_noise = rand_perlin_2d_np(
+                (self.args["img_size"][0], self.args["img_size"][0]), (perlin_scalex, perlin_scaley))
+            # 将噪声旋转
+            perlin_noise = self.rot_perlin(image=perlin_noise)
+            threshold = 0.5
+            # 根据噪声生成掩码图
+            perlin_thr = np.where(perlin_noise > threshold, np.ones_like(perlin_noise), np.zeros_like(perlin_noise))
+
+            # 还是只包含0，1
+            object_perlin_rgb = fg_rgb * perlin_thr
+            object_perlin_deep = fg_deep * perlin_thr
+
+            object_perlin_rgb = np.expand_dims(object_perlin_rgb, axis=2).astype(np.float32)
+            object_perlin_deep = np.expand_dims(object_perlin_deep, axis=2).astype(np.float32)
+            object_perlin = np.logical_or(object_perlin_rgb, object_perlin_deep).astype(int)
+
+            # 计算掩膜的并集
+            msk = object_perlin
+
+            msk = (msk).astype(np.float32)
+            # 只要生成了一个有异常的掩码矩阵，就跳出循环
+            if np.sum(msk) !=0:
+                is_anomaly = 1
+            try_cnt+=1
+
+        # 如果训练数据是纹理图像就只对DTD图像增强，否则1/2概率对DTD增强
+
+        rgb_aug_rand = torch.rand(1).numpy()[0]
+        deep_aug_rand = torch.rand(1).numpy()[0]
+        if rgb_aug_rand > 0.5:  # >0.5 is DTD  # 与＜0.5操作一样
+            aug = self.randAugmenter()
+            anomaly_source_img = cv2.cvtColor(cv2.imread(anomaly_path),cv2.COLOR_BGR2RGB)
+            anomaly_source_img = cv2.resize(anomaly_source_img, dsize=(
+                self.args["img_size"][0], self.args["img_size"][0]))
+            anomaly_img_augmented = aug(image=anomaly_source_img)
+            img_object_thr = anomaly_img_augmented.astype(
+                np.float32) * object_perlin / 255.0
+
+        else: #self-augmentation
+            aug = self.randAugmenter()
+            # 对原始训练的纹理图像进行增强（carpet）
+            anomaly_image = aug(image=cal_image)
+
+            high, width = anomaly_image.shape[0], anomaly_image.shape[1]
+            gird_high, gird_width = int(high/8), int(width/8)
+            # 将原始图片划分成8*8的网格，并随机打乱网格块的顺序
+            wi = np.split(anomaly_image, range(
+                gird_width, width, gird_width), axis=1)
+            wi1 = wi[::2]
+            random.shuffle(wi1)
+            wi2 = wi[1::2]
+            random.shuffle(wi2)
+
+            width_cut_image = np.concatenate(
+                (np.concatenate(wi1, axis=1), np.concatenate(wi2, axis=1)), axis=1)
+            hi = np.split(width_cut_image, range(
+                gird_high, high, gird_high), axis=0)
+            random.shuffle(hi)
+            hi1 = hi[::2]
+            random.shuffle(hi1)
+            hi2 = hi[1::2]
+            random.shuffle(hi2)
+            # # 将打乱顺序的网格块拼接回原始尺寸,得到最终的图像mixer_cut_image
+            mixer_cut_image = np.concatenate(
+                (np.concatenate(hi1, axis=0), np.concatenate(hi2, axis=0)), axis=0)
+
+            img_object_thr = mixer_cut_image.astype(
+                np.float32) * object_perlin / 255.0
+            # perlin_thr = np.where(perlin_noise > threshold, np.ones_like(perlin_noise), np.zeros_like(perlin_noise))
+            # object_perlin = thresh*perlin_thr
+            # img_object_thr = anomaly_image.astype(
+            #     np.float32) * object_perlin
+
+        mul_Deep = (2 + torch.rand(1).numpy()[0] * 8)
+        sub_Deep = (0.1 + torch.rand(1).numpy()[0] * 0.4)
+
+        if deep_aug_rand > 0.5:
+            object_perlin_deep_cal = object_perlin * sub_Deep + (1-object_perlin)
+        else:
+            object_perlin_deep_cal = object_perlin * mul_Deep + (1-object_perlin)
+        # beta表示保留一定自己的特征
+        beta = torch.rand(1).numpy()[0] * 0.6 + 0.2
+        aug_img = img_rgb * \
+            (1 - object_perlin) + (1 - beta) * \
+            img_object_thr + beta * img_rgb * (object_perlin)
+
+        aug_img = aug_img.astype(np.float32)
+
+        aug_depth = cal_depth * object_perlin_deep_cal
+        # 返回增强后的图像、掩膜矩阵、重新标签的异常标签（因为训练时候只有正常图像，而我们随机对其了异常增强）
+        # 数组方便后面正常图像重建，异常图像不重建
+        # aug_depth , aug_img, anomaly_mask, is_anomaly
+
+        # img_deep = np.dstack([aug_depth * 100, aug_depth * 100, aug_depth * 100])
+        # img_deep_org = np.dstack([msk.squeeze() * 100, msk.squeeze() * 100, msk.squeeze() * 100])
+        # img_temp_rgb_mask = Image.fromarray(aug_img.astype(np.uint8))
+        # img_temp_deep_mask = Image.fromarray(img_deep.astype(np.uint8))
+        # img_temp_deep_org_mask = Image.fromarray(img_deep_org.astype(np.uint8))
+        # img_temp_rgb_mask.save('./_rgb'+ '.png')
+        # img_temp_deep_mask.save('./_deep' + '.png')
+        # img_temp_deep_org_mask.save('_deep_org' + '.png')
+
+        return aug_depth,aug_img, msk, np.array([is_anomaly], dtype=np.float32), msk, object_perlin_deep, object_perlin_rgb
+    def transform(self, x, img_len, binary=False):
+        x = x.copy()
+        x = torch.FloatTensor(x)
+        # 如果 x 是 2D 张量,则在第一个维度上增加一个新的维度,使其成为 3D 张量,通道数为 1。
+        # 如果 x 是 3D 张量,则将通道维度移动到第一个维度,并在第一个维度上增加一个新的维度。
+        # 如果 x 的维度不是 2D 或 3D,则会抛出异常
+        if len(x.shape) == 2:
+            x = x[None, None]
+            channels = 1
+        elif len(x.shape) == 3:
+
+            x = x.permute(2, 0, 1)[None]
+            # 假如是深度数据，这个维度就是3，rgb也是一样
+            channels = x.shape[1]
+        else:
+            raise Exception(f'invalid dimensions of x:{x.shape}')
+
+        # 如果 bin 参数为 True,则对下采样后的张量 down 进行二值化处理:将所有大于 0 的元素设置为 1,其他元素保持不变。
+        # 默认不作二值化处理
+        # 这个下采样不改变维度，和unshuffle方法不一样
+        x = downsampling(x, (img_len, img_len), bin=binary)
+        x = x.reshape(channels, img_len, img_len)
+        return x
+
+    def get_3D(self, index):
+        # 从加载的 3D 张量中提取深度图和前景掩码。
+        # depth 变量包含了深度图数据,fg 变量包含了前景掩码数据。
+        sample = np.load(self.depths[index])
+        # 从加载的 3D 张量中提取深度图和前景掩码。
+        # depth 变量包含了深度图数据,fg 变量包含了前景掩码数据。即整个矩阵只由0或者1组成
+        depth = sample[:, :, 0]
+        sub_fg_depth = sample[:, :, 1]
+        fg = sample[:, :, -1]
+        # 前景掩膜和深度维度进行逐像素相乘（后面几步相当于做了均值化）
+        mean_fg = np.sum(fg * depth) / np.sum(fg)
+        depth = fg * depth + (1 - fg) * mean_fg
+        depth = (depth - mean_fg) #* 100
+
+        sub_mean_fg = np.sum(fg * sub_fg_depth) / np.sum(fg)
+        sub_fg_depth = fg * sub_fg_depth + (1 - fg) * sub_mean_fg
+        sub_fg_depth = (sub_fg_depth - sub_mean_fg)  # * 100
+        return depth, fg, sub_fg_depth
+
+
+    def __getitem__(self, index):
+        # 如果使用 3D 数据集,则调用 self.get_3D(index) 方法获取深度图像 depth 和前景掩码 fg
+        if self.args["use_3D_dataset"]:
+            # 真正的depth也去除了前景掩膜
+            depth, fg_deep, sub_fg_depth = self.get_3D(index)
+            # 下采样改变数据维度
+            # depth_size = [256,256] tensor
+            depth = self.transform(depth, self.args["deep_size"][0], binary=False)
+            depth = depth.permute(1, 2, 0)
+
+            sub_fg_depth = self.transform(sub_fg_depth, self.args["deep_size"][0], binary=False)
+            sub_fg_depth = sub_fg_depth.permute(1, 2, 0)
+            # temp3 = msk.squeeze()
+
+            # 前景掩码在下采样时仍要保持2值 tensor
+            fg_deep = self.transform(fg_deep, self.args["deep_size"][0], binary=True)
+            fg_deep = fg_deep.squeeze()
+            fg_deep = fg_deep.numpy()
+            # fg_deep = fg_deep.numpy()
+            fg_rgb_path = self.images[index].replace('train\\good\\rgb', 'fg')
+            fg_rgb = cv2.imread(fg_rgb_path, 0)
+            fg_rgb = cv2.resize(fg_rgb, dsize=(self.args["img_size"][0], self.args["img_size"][0]))
+        else:
+            # 如果是2D图像，则前景掩膜和深度都默认设置为1即可
+            depth = torch.zeros([1, self.args["deep_size"], self.args["deep_size"]])
+            fg_deep = torch.ones([1, self.args["deep_size"], self.args["deep_size"]])
+            fg_rgb = torch.ones([1, self.args["img_size"], self.args["img_size"]])
+
+        # if self.set == 'test' or not self.get_features:
+        #     with open(self.images[index], 'rb') as f:
+        #         # 使用 convert('RGB') 方法将图像转换为 RGB 颜色模式。
+        #         img = Image.open(f).convert('RGB')
+        #     img = self.image_transforms(img)
+        # else:
+        #     img = 0
+
+        img_rgb = cv2.imread(self.images[index], cv2.COLOR_RGB2BGR)
+        img_rgb = cv2.resize(img_rgb, dsize=(self.args["img_size"][0], self.args["img_size"][0]))
+        cal_image = img_rgb
+
+        img_rgb = img_rgb.astype(np.float32)/255.0
+        fg_rgb = fg_rgb.astype(np.float32)/255.0
+        # len(self.anomaly_source_paths)表示异常数据集的所有图片量
+        anomaly_source_idx = torch.randint(0, len(self.anomaly_source_paths), (1,)).item()
+        # 随机选取纹理图片路径
+        anomaly_path = self.anomaly_source_paths[anomaly_source_idx]
+        # image原始图像、前景掩膜\原始图像训练、DTD数据图片路径、cv2处理后的原始图像
+
+        cal_depth = depth.numpy()
+        aug_depth , aug_img, anomaly_mask, is_anomaly, msk, object_perlin_deep, object_perlin_rgb  = self.perlin_synthetic(img_rgb,fg_rgb,depth, fg_deep,anomaly_path,cal_image,cal_depth,sub_fg_depth)
+
+
+        aug_img = (np.transpose(aug_img, (2, 0, 1))).astype(np.float32)
+        img_rgb = (np.transpose(img_rgb, (2, 0, 1))).astype(np.float32)
+        # temp1 = numpy.sum(aug_img, 0)
+        # temp2 = numpy.sum(img_rgb,0)
+        # temp3 = msk.squeeze()
+        depth = depth.numpy()
+        sub_fg_depth = sub_fg_depth.numpy()
+        depth = np.transpose(depth, (2, 0, 1)).astype(np.float32)
+        sub_fg_depth = np.transpose(sub_fg_depth, (2, 0, 1)).astype(np.float32)
+
+        aug_depth = np.transpose(aug_depth, (2, 0, 1)).astype(np.float32)
+        msk = np.transpose(msk, (2, 0, 1)).astype(np.float32)
+
+        # temp_Mask = msk.squeeze()
+
+        # 原图的掩膜
+        normal_mask = np.zeros_like(msk).astype(np.float32)
+        object_perlin_deep = np.transpose(object_perlin_deep, (2, 0, 1)).astype(np.float32)
+        object_perlin_rgb = np.transpose(object_perlin_rgb, (2, 0, 1)).astype(np.float32)
+
+
+
+        # if self.get_features:
+        #     extract_img = torch.from_numpy(np.expand_dims(aug_img, 0)).to('cuda')
+        #     with torch.no_grad():
+        #         z = self.extract_model(extract_img)
+        #     features_aug_t = t2np(z[0].squeeze())
+        #     features_aug_m = t2np(z[1].squeeze())
+        #     features_aug_b = t2np(z[2].squeeze())
+        #     features_t = self.features_t[index]
+        #     features_m = self.features_m[index]
+        #     features_b = self.features_b[index]
+
+        sample = {'image': img_rgb,'depth': depth, 'sub_fg_depth': sub_fg_depth, 'is_anomaly': is_anomaly, 'aug_img': aug_img,'aug_depth':aug_depth,
+                  # 'features_b': features_b, 'features_m': features_m, 'features_t': features_t,
+                  # 'features_aug_t': features_aug_t, 'features_aug_m': features_aug_m, 'features_aug_b': features_aug_b,
+                  'anomaly_msk': msk,'deep_msk':object_perlin_deep,'rgb_msk':object_perlin_rgb, 'idx': index,
+                  'type': self.images[index][self.images[index].find(".")+1:], 'normal_msk': normal_mask,
+                  'path': self.images[index] }
+
+        # ret = [depth ,is_anomaly, aug_img, aug_depth, anomaly_mask]
+
+        return sample
+
+
+class MVTec3DTestDataset(Dataset):
+    def __init__(self, get_features=True, classname=None, args=None):
+        super(MVTec3DTestDataset, self).__init__()
+        self.args = args
+        self.class_name = classname
+        self.set = "test"
+        self.gts = list()
+        self.images = list()
+        self.depths = list()
+        self.is_Anomalys = list()
+
+        self.get_features = get_features
+
+        root = join(args["mvtec3d_root_path"], classname)
+        set_dir = os.path.join(root, self.set)
+        subclass = os.listdir(set_dir)
+        subclass.sort()
+        for sc in subclass:  # 测试数据不只有"good"
+            sub_dir = os.path.join(set_dir, sc)
+            img_dir = join(sub_dir, 'rgb') if args["use_3D_dataset"] else sub_dir
+            # 获得所有rgb图片的路径
+            img_paths = os.listdir(img_dir)
+            # 对图片进行排序
+            img_paths.sort()
+            # 遍历所有图片路径
+            for p in img_paths:
+                if sc != "good":
+                    self.is_Anomalys.append(1)
+                else:
+                    self.is_Anomalys.append(0)
+
+                # 加载图片完整路径，p为文件名
+                i_path = os.path.join(img_dir, p)
+                # 如果图片不是下面这几种格式直接跳过
+                if not i_path.lower().endswith(
+                        ('.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff', '.webp')):
+                    continue
+                # 添加图片完整路径
+                self.images.append(i_path)
+                # 在测试图片中，good也有gt图像
+                gt_path = i_path.replace('rgb', 'gt')
+                self.gts.append(gt_path)
+                # 添加深度图片完整路径
+                if args["use_3D_dataset"]:
+                    #  把rgb替换为z,.npy文件里面有深度图像的掩码和深度数据
+                    self.depths.append(i_path.replace('rgb', 'z')[:-4] + '.npy')
+
+        # if get_features:
+        #     # 获取不同类别图的特征，可能是之前已经提取过的
+        #     self.features = np.load(os.path.join(args["feature_dir"], classname, self.set + '.npy'))
+
+        # self.img_mean = torch.FloatTensor(args["norm_mean"])[:, None, None]
+        # self.img_std = torch.FloatTensor(args["norm_std"])[:, None, None]
+
+        # foreground_path = os.path.join(args["mvtec3d_root_path"], classname)
+        # self.foreground_path = sorted(glob.glob(foreground_path + "/fg/*.png"))
+
+    def __len__(self):
+        return len(self.images)
+
+    def transform(self, x, img_len, binary=False):
+        x = x.copy()
+        x = torch.FloatTensor(x)
+        # 如果 x 是 2D 张量,则在第一个维度上增加一个新的维度,使其成为 3D 张量,通道数为 1。
+        # 如果 x 是 3D 张量,则将通道维度移动到第一个维度,并在第一个维度上增加一个新的维度。
+        # 如果 x 的维度不是 2D 或 3D,则会抛出异常
+        if len(x.shape) == 2:
+            x = x[None, None]
+            channels = 1
+        elif len(x.shape) == 3:
+
+            x = x.permute(2, 0, 1)[None]
+            # 假如是深度数据，这个维度就是3，rgb也是一样
+            channels = x.shape[1]
+        else:
+            raise Exception(f'invalid dimensions of x:{x.shape}')
+
+        # 如果 bin 参数为 True,则对下采样后的张量 down 进行二值化处理:将所有大于 0 的元素设置为 1,其他元素保持不变。
+        # 默认不作二值化处理
+        # 这个下采样不改变维度，和unshuffle方法不一样
+        x = downsampling(x, (img_len, img_len), bin=binary)
+        x = x.reshape(channels, img_len, img_len)
+        return x
+
+    def get_3D(self, index):
+        # 从加载的 3D 张量中提取深度图和前景掩码。
+        # depth 变量包含了深度图数据,fg 变量包含了前景掩码数据。
+        sample = np.load(self.depths[index])
+        # 从加载的 3D 张量中提取深度图和前景掩码。
+        # depth 变量包含了深度图数据,fg 变量包含了前景掩码数据。即整个矩阵只由0或者1组成
+        depth = sample[:, :, 0]
+        fg = sample[:, :, -1]
+        # 前景掩膜和深度维度进行逐像素相乘（后面几步相当于做了均值化）
+        mean_fg = np.sum(fg * depth) / np.sum(fg)
+        depth = fg * depth + (1 - fg) * mean_fg
+        depth = (depth - mean_fg)# * 100
+        return depth, fg
+
+    def __getitem__(self, index):
+        # 如果使用 3D 数据集,则调用 self.get_3D(index) 方法获取深度图像 depth 和前景掩码 fg
+        if self.args["use_3D_dataset"]:
+            depth, fg_deep = self.get_3D(index)
+            # 下采样改变数据维度
+            # depth_size = [256,256] tensor
+            depth = self.transform(depth, self.args["deep_size"][0], binary=False)
+            depth = depth.permute(1, 2, 0)
+        else:
+            # 如果是2D图像，则前景掩膜和深度都默认设置为1即可
+            depth = torch.zeros([1, self.args["deep_size"], self.args["deep_size"]])
+
+        # if self.set == 'test' or not self.get_features:
+        #     with open(self.images[index], 'rb') as f:
+        #         # 使用 convert('RGB') 方法将图像转换为 RGB 颜色模式。
+        #         img = Image.open(f).convert('RGB')
+        #     img = self.image_transforms(img)
+        # else:
+        #     img = 0
+
+        depth = depth.numpy()
+
+        img_rgb = cv2.imread(self.images[index], cv2.COLOR_RGB2BGR)
+        img_rgb = cv2.resize(img_rgb, dsize=(self.args["img_size"][0], self.args["img_size"][0]))
+
+        # test_img = img_rgb
+
+        gt_path = self.gts[index]
+        img_gt = cv2.imread(gt_path, 0)
+        img_gt = cv2.resize(img_gt, dsize=(self.args["img_size"][0], self.args["img_size"][0])).astype(np.float32)
+
+        is_anomaly = self.is_Anomalys[index]
+
+        img_gt[img_gt > 0] = 1
+
+        img_gt = np.expand_dims(img_gt, axis=0).astype(np.float32)
+        img_rgb = (np.transpose(img_rgb, (2, 0, 1))).astype(np.float32)/255.0
+        depth = np.transpose(depth, (2, 0, 1)).astype(np.float32)
+        # tempDepth = depth.squeeze()
+        # temp_gt = img_gt.squeeze()
+        # temp_sum = temp_gt.sum()
+
+        # print(img_rgb.shape)
+        # print(img_gt.shape)
+
+        # img_deep = np.dstack([img_gt.squeeze() * 200, img_gt.squeeze() * 200, img_gt.squeeze() * 200])
+        # img_deep_org = np.dstack([msk.squeeze() * 100, msk.squeeze() * 100, msk.squeeze() * 100])
+        # img_temp_rgb_mask = Image.fromarray(test_img.astype(np.uint8))
+        # img_temp_deep_mask = Image.fromarray(img_deep.astype(np.uint8))
+        # img_temp_deep_org_mask = Image.fromarray(img_deep_org.astype(np.uint8))
+        # img_temp_rgb_mask.save('../testDataset/_rgb_test'+ '.png')
+        # img_temp_deep_mask.save('../testDataset/_deep_test' + '.png')
+        # img_temp_deep_org_mask.save('_deep_org' + '.png')
+
+        sample = {'image': img_rgb, 'depth': depth, 'is_anomaly': np.array([is_anomaly], dtype=np.float32), 'img_gt': img_gt,
+                   'idx': index, 'type': self.images[index][self.images[index].find(".") + 1:],
+                  'path': self.images[index]}
+
+        # ret = [depth ,is_anomaly, aug_img, aug_depth, anomaly_mask]
+
+        return sample
